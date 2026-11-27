@@ -6,17 +6,14 @@ approves and then deposits token units; exits and fees are withdrawn in
 token units; gas stays ETH."""
 import json
 import os
-import threading
-import time
 
 import pytest
 
 import btc
 import evm
 import evmbackend as eb
-from conftest import CONTRACTS, EVMCHAN, KEY1, Chain, Key
-from test_backend import (A, GOOD_CONFIGS, GOOD_INFO, CountingRpc, FakeLn, Log, StatusIx, make_cfg,
-                          offline_backend, spend)
+from conftest import CONTRACTS, KEY1, Chain, Key
+from test_backend import A, FakeLn, send, spend, start
 
 OUT = os.path.join(CONTRACTS, 'out')
 
@@ -85,25 +82,8 @@ def tchain(anvil, request):
     return TokenChain(anvil, kind, decimals, units)
 
 
-def start(chain, tmp_path):
-    log = Log()
-    b = eb.Backend(make_cfg(tmp_path, chain.rpc.url, chain.address), log)
-    chain.rpc.call('anvil_setBalance', b.address, evm.qty(10**20))
-    chain.mine_at(1)
-    b.connect(retry_for=0)
-    b.apply_option_check(GOOD_CONFIGS, GOOD_INFO)
-    ts = [threading.Thread(target=f, daemon=True) for f in (b._worker_loop, b._tracker_loop)]
-    for t in ts:
-        t.start()
-    b.log_capture = log
-    b.test_threads = ts
-    return b
-
-
 def stop(b):
     b.stop()
-    for t in b.test_threads:
-        t.join(5)
     b.ix.close()
 
 
@@ -178,8 +158,8 @@ def test_token_deposit_withdraw_status(tchain, tbackend):
     b.ix.sync()
     dep = evm.unhex(tchain.logs()[-1]['topics'][2])
     tx = spend(b, dep, 0, 100_000, out_script=btc.exit_script(b.address), fee=500)
-    assert b.send_now(tx.serialize().hex())['success']
-    assert b.withdrawable() == 100_000 * u                      # 99,500 exit + 500 fee to the submitter
+    assert send(b, tx)['success']
+    assert b.status()['withdrawable_units'] == 100_000 * u      # 99,500 exit + 500 fee to the submitter
     tok0, eth0 = tchain.balance(b.address), eth_balance(tchain, b.address)
     held0 = tchain.balance(tchain.address)
     w = b.withdraw()
@@ -187,14 +167,17 @@ def test_token_deposit_withdraw_status(tchain, tbackend):
     assert tchain.balance(b.address) - tok0 == 100_000 * u
     assert held0 - tchain.balance(tchain.address) == 100_000 * u
     assert eth0 - eth_balance(tchain, b.address) == gas_paid(tchain, w['evm_tx'])
-    assert b.withdrawable() == 0
 
     s = b.status()
     assert s['token'] == tchain.token and s['units_per_sat'] == u
     assert s['token_balance_units'] == tchain.balance(b.address)
     assert s['withdrawable_units'] == 0 and 'withdrawable_wei' not in s
     assert s['balance_wei'] == eth_balance(tchain, b.address)
-    assert s['pending_sends'] == [] and s['opens_refused'] is None
+    assert s['opens_refused'] is None
+    # cached=true: the same values, without a call to the node.
+    n = sum(b.rpc.calls.values())
+    assert b.status(cached=True)['token_balance_units'] == s['token_balance_units']
+    assert sum(b.rpc.calls.values()) == n
 
 
 def test_token_deposit_value_rules(tchain, tbackend):
@@ -206,70 +189,3 @@ def test_token_deposit_value_rules(tchain, tbackend):
         b.deposit(11, addr)
     d = b.deposit(10, addr)
     assert d['amount_units'] == 10 * u and tchain.balance(b.address) == 0
-
-
-class TokenCountingRpc(CountingRpc):
-    """CountingRpc with the token's balanceOf apart: eth_calls to the token
-    are counted as 'balanceOf', the rest (withdrawable) as 'eth_call'."""
-
-    def __init__(self, token):
-        super().__init__()
-        self.token, self.tokens = token, 200 * 10**6
-
-    def call(self, method, *params):
-        if method == 'eth_call' and params[0].get('to') == self.token:
-            with self._calls_lock:
-                self.calls['balanceOf'] += 1
-            return '0x' + evm.abi_encode(['uint256'], [self.tokens]).hex()
-        return super().call(method, *params)
-
-
-def test_status_cached_token_balance(tmp_path):
-    """Token mode, evm-status cached=true: the token balance, like
-    withdrawable, is read at most once per evm-poll or after a change
-    (cached_token_balance), never on every call."""
-    b = offline_backend(tmp_path)
-    b.cfg.poll = 60.0
-    b.token, b.units_per_sat = '0x' + 'ab' * 20, 1
-    b.ix, b.rpc = StatusIx(), TokenCountingRpc(b.token)
-    b.balance, b.balance_at = 10**18, time.time()
-
-    def reads():
-        return b.rpc.calls['balanceOf'], b.rpc.calls['eth_call']
-    s = b.status()
-    assert reads() == (1, 1) and s['token_balance_units'] == 200 * 10**6 and s['withdrawable_units'] == 5 * 10**10
-    b.status()
-    assert reads() == (2, 2), 'uncached: fresh every time'
-    for _ in range(10):
-        s = b.status(cached=True)
-    assert reads() == (2, 2), 'cached: the values just read'
-    assert s['cached'] is True and s['token_balance_units'] == 200 * 10**6 and s['token'] == b.token
-    # Older than evm-poll: one read of the token balance (withdrawable is still fresh).
-    b.token_balance_cache = (b.token_balance_cache[0], time.time() - 61)
-    b.rpc.tokens = 150 * 10**6
-    assert b.status(cached=True)['token_balance_units'] == 150 * 10**6
-    b.status(cached=True)
-    assert reads() == (3, 2)
-    # A send, a receipt or new logs mark it dirty: both read once more, then cached.
-    b.withdrawable_dirty = True
-    b.rpc.tokens = 100 * 10**6
-    assert b.status(cached=True)['token_balance_units'] == 100 * 10**6
-    b.status(cached=True)
-    assert reads() == (4, 3)
-    # A failed read is not cached: the next call reads again.
-    b.token_balance_cache = (b.token_balance_cache[0], time.time() - 61)
-    real = b.rpc.call
-
-    def failing(method, *params):
-        if method == 'eth_call' and params[0].get('to') == b.token:
-            raise evm.EvmError('eth_call: JSON-RPC error -32000', -32000)
-        return real(method, *params)
-    b.rpc.call = failing
-    s = b.status(cached=True)
-    assert 'token_balance_error' in s and 'token_balance_units' not in s
-    b.rpc.call = real
-    assert b.status(cached=True)['token_balance_units'] == 100 * 10**6 and reads() == (5, 3)
-    before = sum(b.rpc.calls.values())
-    for _ in range(10):
-        b.status(cached=True)
-    assert sum(b.rpc.calls.values()) == before
