@@ -10,6 +10,23 @@ is what the implementation follows.
 MUST and MUST NOT are normative. Anything this spec doesn't decide is an open
 question (section 10), not an implementation choice.
 
+> **The plugin in this tree is a minimal build, for testnets.** The contract
+> (section 4), the virtual chain (section 3) and the CLN options (5.6) are as
+> specified. Section 5 otherwise describes the full plugin, which this build
+> cuts down to what a testnet node needs. What it does **not** implement:
+>
+> | Section | Specified | This build |
+> |---|---|---|
+> | 5.2 | Checkpoints: the index is proven against the contract's `txCount`/`logHash`; repair on a mismatch | The EVM node's logs are trusted. Rows at or below the tag block are final; rows above it are re-read every poll |
+> | 5.2 | EVM reorgs followed at any depth | Only above the tag block. With `evm-confirm=latest` (anvil) no reorg is followed: delete `evmchan.sqlite3` to rebuild |
+> | 5.2 | Snapshots (`--evm-snapshot`, `evm-snapshot`), witness checks, undecodable events counted | None. An undecodable event is logged at BROKEN level and skipped |
+> | 5.3 | Sends tracked in `evm-pending.json` across restarts, replaced on a timer, re-sent after a reorg; an answer within `2 x INTERVAL` | One send at a time, at the chain's own nonce, waiting up to 30 s for its receipt. A send that finds its nonce still held by the last one replaces it at 1.25x the fees. If the chain's nonce is below the one after our last mined send and that send has no receipt any more (a reorg took it back), the next send goes at the chain's nonce again. lightningd's own rebroadcasts do the rest |
+> | 5.4 | Peer identity message; checks on our own open commands (`rpc_command`); dual funding with PSBT checks; the HTLC cap on forwards | Peers without anchors are disconnected; inbound opens must be anchors with at most 30 HTLCs; every dual-funded open is refused. All nodes must be on the same contract and run with the 5.6 options |
+> | 5.5 | `evm-txinfo`, `evm-snapshot`; the `witness` alarm; `pending_sends` in `evm-status` | Not present. The options `evm-snapshot`, `evm-require-peer-identity` and `evm-dev-no-outbound-filter` are gone too: lightningd refuses to start if one is still passed |
+>
+> Do not run it with funds that matter: an EVM node that lies or withholds
+> logs is not detected.
+
 ## 1. Scope
 
 - **What.** Lightning channels in ETH on an EVM chain, with **no change to CLN's
@@ -29,6 +46,7 @@ Components and where they live:
 | `contracts/evm/` | Foundry project, standalone (no dependency on this tree to build or test it): `UtxoChainBase.sol`, the deployables `UtxoChain.sol` (ETH) and `UtxoChainToken.sol` (4.6), their libraries, tests, deploy script |
 | `contrib/evmchan/gen_vectors.py` | Writes the contract's test vectors into `contracts/evm/test/generated/` (from the CLN vectors, the BIP vectors and `reference/`) |
 | `contrib/evmchan/evmbackend.py` | The backend plugin (stdlib + coincurve) |
+| `contrib/evmchan/evmindex.py` | The index: the contract's `TxApplied` logs in SQLite, and the virtual chain served from them |
 | `contrib/evmchan/evm.py` | EVM JSON-RPC, keccak, RLP, EIP-1559 signing, ABI (from spike S6) |
 | `contrib/evmchan/btc.py` | Bitcoin tx/block serialization, bech32 (from spike S1) |
 | `contrib/evmchan/run-anvil.sh` | Starts anvil and deploys the contract, for tests and local use |
@@ -488,6 +506,17 @@ lightningd --network=regtest --disable-plugin=bcli \
     its own `DEPLOYER_PRIVATE_KEY`.
 - **`evm-confirm`:** `safe` (default) or `latest`.
 - **`evm-poll`:** seconds between polls.
+  - Polls are taken at the wall clock's multiples of `evm-poll`, plus an
+    offset of 0–30 s (at most a quarter of a poll) fixed by the node's ETH
+    address. `safe` on an L2 moves in steps of minutes: nodes that poll at
+    their own times read it before and after a step and differ by that many
+    virtual blocks until the later one polls again, and a payee ahead of the
+    payer refuses its payment as expiring too soon. With polls in the same
+    part of each period nodes disagree for the spread at most. They are not
+    all in the same second: nodes that share an API key would exceed its
+    rate limit whenever there are logs to read.
+  - A failed sync is tried again after 15 s, doubling with each failure in a
+    row, and never later than the regular poll.
   - Default 60, which suits Infura's free tier (5.2).
   - Use 1 on anvil.
 - **`evm-min-balance`:** the ETH below which the plugin refuses new channels and

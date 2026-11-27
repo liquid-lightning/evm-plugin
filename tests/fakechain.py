@@ -103,11 +103,6 @@ class FakeChain(evm.EvmRpc):
             return '0x6000' if params[0].lower() == CONTRACT.lower() else '0x'
         if method == 'eth_call':
             sel = evm.unhex(params[0]['data'])
-            if sel in (evm.selector('txCount()'), evm.selector('logHash()')):
-                count, loghash = self.state_at(params[1])
-                if sel == evm.selector('txCount()'):
-                    return '0x' + evm.abi_encode(['uint256'], [count]).hex()
-                return '0x' + loghash.hex()
             for name, v in (('DEPLOY_BLOCK', self.deploy_block), ('GENESIS_TIME', self.G),
                             ('INTERVAL', self.I)):
                 if sel == evm.selector(name + '()'):
@@ -135,23 +130,6 @@ class FakeChain(evm.EvmRpc):
                                    -32005)
             return [dict(log) for log in out]
         raise evm.EvmError('{}: method not found'.format(method), -32601)
-
-    def state_at(self, block):
-        """The contract's (txCount, logHash) at a block tag, number or
-        EIP-1898 {'blockHash': ...} (unknown hash: anvil's error)."""
-        if isinstance(block, dict):
-            hit = [b for b in self.blocks if b['hash'] == block['blockHash']]
-            if not hit:
-                raise evm.EvmError('eth_call: JSON-RPC error -32001', -32001)
-            n = hit[0]['number']
-        else:
-            n = int(self._block(block)['number'], 16)
-        count, h = 0, bytes(32)
-        for b in self.blocks[:n + 1]:
-            for log in b['logs']:
-                count += 1
-                h = evmindex.log_step(h, int(log['topics'][1], 16), evm.unhex(log['topics'][2]))
-        return count, h
 
     def count(self, method):
         return sum(1 for m, _ in self.calls if m == method)

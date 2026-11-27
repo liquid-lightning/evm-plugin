@@ -2,7 +2,7 @@
 """btc.py and evmindex against the real contract on anvil (started with
 run-anvil.sh): deposit txs and txids, real signed submits, blocks, the tip
 following `safe`, utxo() through spends, exits and OP_RETURN, add_receipt,
-and reorgs (evm_snapshot/evm_revert, anvil_reorg, anvil_rollback)."""
+and a reorg above the tag (evm_snapshot/evm_revert)."""
 import pytest
 
 import btc
@@ -82,10 +82,10 @@ def test_blocks_heights_and_tip(chain, index):
     data = evm.calldata('deposit(bytes)', ['bytes'], [C.p2wpkh])
     many = chain.send_many([(70000 * SAT, data), (80000 * SAT, data)], 3)
     chain.confirm(5)
-    r = ix.sync()
+    assert ix.sync() is True
     assert not ix.ibd
     safe = chain.rpc.block('safe')
-    assert ix.tip() == r['tip'] == ix.height_at(int(safe['timestamp'], 16)) - 1 >= 5
+    assert ix.tip() == ix.height_at(int(safe['timestamp'], 16)) - 1 >= 5
     by_height = check_blocks(ix, chain)
     assert [len(by_height.get(h, [])) for h in range(6)] == [0, 2, 0, 2, 0, 0]
     for rc in (d1, d2):
@@ -94,7 +94,7 @@ def test_blocks_heights_and_tip(chain, index):
     txs = btc.parse_block(raw)[1]
     assert [t.outputs[0][0] for t in txs[1:]] == [70000, 80000]
     assert [t.txid() for t in txs[1:]] == [deposit_log(chain, rc)[1] for rc in many]
-    assert ix.lag() == ix.height_at(chain.latest_ts()) - ix.tip()
+    assert ix.current_height() == ix.height_at(chain.latest_ts())
 
 
 def test_submits_spends_exits_op_return(chain, index):
@@ -141,20 +141,8 @@ def test_submits_spends_exits_op_return(chain, index):
         assert chain.is_unspent(txid, vout, amount, spk, h) == (ix.utxo_internal(txid, vout) is not None)
 
     chain.confirm(3)
-    assert ix.sync()['proven']
+    ix.sync()
     check_blocks(ix, chain)
-    # SPEC 4.1: txCount and logHash, recomputed here from the node's own logs
-    # (Python keccak), equal the contract's; the index's checkpoint is the
-    # contract's state at that block, read with EIP-1898.
-    count, h = 0, bytes(32)
-    for log in sorted(chain.logs(), key=lambda x: (int(x['blockNumber'], 16), int(x['logIndex'], 16))):
-        count, h = count + 1, evmindex.log_step(h, int(log['topics'][1], 16), evm.unhex(log['topics'][2]))
-    assert count == 3 == chain.const('txCount')
-    assert evm.abi_decode(['bytes32'], chain.rpc.eth_call(chain.address, evm.selector('logHash()')))[0] == h
-    number, bhash, cp_count, cp_hash = ix.checkpoint()
-    at = {'blockHash': bhash}
-    assert cp_count == evm.abi_decode(['uint256'], chain.rpc.eth_call(chain.address, evm.selector('txCount()'), at))[0]
-    assert evm.unhex(cp_hash) == chain.rpc.eth_call(chain.address, evm.selector('logHash()'), at)
     _, raw = ix.block(2)
     txs = btc.parse_block(raw)[1]
     assert [t.serialize() for t in txs[1:]] == [raw1, raw2]     # with witness, in EVM order
@@ -191,7 +179,9 @@ def test_tip_follows_safe_and_never_decreases(chain, index, tmp_path):
     latest_ix.close()
 
 
-def test_reorg_snapshot_revert(chain, index):
+def test_reorg_above_the_tag(chain, index):
+    """The block above `safe` is re-read every poll, so its reorg is
+    followed. One below the tag is not (evmindex's docstring)."""
     ix = index
     chain.mine_at(1)
     ix.sync()
@@ -205,45 +195,10 @@ def test_reorg_snapshot_revert(chain, index):
     rc = chain.deposit(B.p2tr, 2222, 2)
     new = deposit_log(chain, rc)[1]
     assert int(rc['blockNumber'], 16) == gone_block and new != gone
-    r = ix.sync()
-    assert r['dropped'] == 1
+    assert ix.sync() is True
     assert ix.utxo_internal(gone, 0) is None and ix.tx(btc.display(gone)) is None
     assert ix.utxo_internal(new, 0) == {'amount': 2222, 'script': B.p2tr, 'height': 2}
     chain.confirm(3)
-    ix.sync()
-    check_blocks(ix, chain)
-
-
-def test_reorg_anvil_reorg_and_rollback(chain, index):
-    ix = index
-    chain.mine_at(1)
-    ix.sync()
-    d = deposit_log(chain, chain.deposit(A.p2wpkh, 3333, 2))[1]
-    chain.mine(chain.latest_ts() + 1)
-    ix.sync()
-    assert ix.utxo_internal(d, 0)
-    # anvil_reorg: the last 2 blocks replaced by empty ones.
-    chain.rpc.call('anvil_reorg', 2, [])
-    r = ix.sync()
-    assert r['proven'] and r['dropped'] == 1     # the log hash at the tag disagreed: repaired
-    assert ix.utxo_internal(d, 0) is None
-    # Again, then anvil_rollback: the chain gets shorter than the deposit's block.
-    d2 = deposit_log(chain, chain.deposit(B.p2tr, 4444, chain.height_now() + 1))[1]
-    ix.sync()
-    assert ix.utxo_internal(d2, 0)
-    chain.rpc.call('anvil_rollback', 1)
-    # `latest` went down: a stale backend for SPEC 5.2, so the poll is skipped
-    # and nothing is deleted...
-    assert ix.sync()['skipped'] == 'stale'
-    assert ix.utxo_internal(d2, 0)
-    # ...until the chain is that long again and a proof covers the block.
-    chain.mine(chain.latest_ts() + 1)
-    ix.sync()
-    chain.mine(chain.latest_ts() + 1)
-    r = ix.sync()
-    assert r['proven'] and r['dropped'] >= 1
-    assert ix.utxo_internal(d2, 0) is None
-    chain.confirm(chain.height_now() + 1)
     ix.sync()
     check_blocks(ix, chain)
 
